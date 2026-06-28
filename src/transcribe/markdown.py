@@ -33,7 +33,7 @@ def render_transcript(
         f"# {title}",
         "",
         f"Started: {started_at.strftime('%Y-%m-%d %H:%M:%S %Z')}",
-        f"Model: faster-whisper {model_name}",
+        f"Model: {model_name}",
         f"Device: {device}",
         f"Compute type: {compute_type}",
     ]

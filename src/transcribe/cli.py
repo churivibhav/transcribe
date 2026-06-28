@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import importlib.util
 import select
 import shutil
 import sys
@@ -24,22 +25,26 @@ from .meeting import create_meeting, write_metadata
 from .notes import generate_summary
 from .recorder import analyze_audio_volume, convert_wav_to_mp3, record_audio_sample, start_recording
 from .system import command_exists
-from .transcriber import ChunkTranscriber
+from .transcriber import DEFAULT_ENGINE, OPENVINO_ENGINE, create_transcription_engine, normalize_engine_name
 
 app = typer.Typer(help="Linux meeting recorder and live transcription tool.")
 console = Console()
 
 
 class LiveSession:
-    def __init__(self, settings: Settings, title: str | None, with_summary: bool) -> None:
+    def __init__(self, settings: Settings, title: str | None, with_summary: bool, engine_name: str | None) -> None:
         self.settings = settings
         self.paths = create_meeting(settings.output_dir(), title)
         self.with_summary = with_summary
         self.segments: list[TranscriptSegment] = []
-        self.transcriber = ChunkTranscriber(settings)
+        self.engine = create_transcription_engine(settings, engine_name=engine_name)
+        self.initial_engine_name = self.engine.name
+        self.engine_switches: list[dict[str, float | str]] = []
+        self._stream_segments: dict[float, TranscriptSegment] = {}
         self._stop_event = threading.Event()
         self._error: str | None = None
         self._lock = threading.Lock()
+        self._engine_lock = threading.Lock()
         self.status = "Recording"
 
     def append_segments(self, new_segments: list[TranscriptSegment]) -> None:
@@ -48,29 +53,111 @@ class LiveSession:
             self.segments.sort(key=lambda segment: segment.start_seconds)
         self.write_transcript(None)
 
+    def update_stream_segments(self, new_segments: list[TranscriptSegment]) -> None:
+        grouped_segments = self._group_stream_segments(new_segments)
+        with self._lock:
+            for segment in grouped_segments:
+                key = self._stream_segment_key(segment)
+                self._stream_segments[key] = segment
+            chunk_segments = [
+                segment
+                for segment in self.segments
+                if self._stream_segment_key(segment) not in self._stream_segments
+            ]
+            self.segments = sorted(chunk_segments + list(self._stream_segments.values()), key=lambda segment: segment.start_seconds)
+        self.write_transcript(None)
+
+    @staticmethod
+    def _stream_segment_key(segment: TranscriptSegment) -> float:
+        return round(segment.start_seconds, 1)
+
+    @staticmethod
+    def _group_stream_segments(segments: list[TranscriptSegment]) -> list[TranscriptSegment]:
+        if not segments:
+            return []
+
+        sorted_segments = sorted(segments, key=lambda segment: segment.start_seconds)
+        grouped: list[TranscriptSegment] = []
+        current_start = sorted_segments[0].start_seconds
+        current_end = sorted_segments[0].end_seconds
+        current_text_parts = [sorted_segments[0].text.strip()]
+
+        for segment in sorted_segments[1:]:
+            text = segment.text.strip()
+            if not text:
+                continue
+            gap_seconds = segment.start_seconds - current_end
+            if gap_seconds <= 2.0:
+                current_end = max(current_end, segment.end_seconds)
+                if not current_text_parts or current_text_parts[-1] != text:
+                    current_text_parts.append(text)
+                continue
+
+            grouped.append(
+                TranscriptSegment(
+                    start_seconds=current_start,
+                    end_seconds=current_end,
+                    text=" ".join(current_text_parts).strip(),
+                )
+            )
+            current_start = segment.start_seconds
+            current_end = segment.end_seconds
+            current_text_parts = [text]
+
+        grouped.append(
+            TranscriptSegment(
+                start_seconds=current_start,
+                end_seconds=current_end,
+                text=" ".join(current_text_parts).strip(),
+            )
+        )
+        return grouped
+
     def write_transcript(self, duration_seconds: float | None) -> None:
         with self._lock:
             segments = list(self.segments)
+        with self._engine_lock:
+            engine = self.engine
         content = render_transcript(
             title=self.paths.title,
             started_at=self.paths.started_at,
             duration_seconds=duration_seconds,
-            model_name=self.settings.whisper_model,
-            device=self.settings.whisper_device,
-            compute_type=self.settings.whisper_compute_type,
+            model_name=engine.model_name,
+            device=engine.device,
+            compute_type=engine.compute_type,
             segments=segments,
         )
         self.paths.transcript_md.write_text(content, encoding="utf-8")
 
+    def switch_engine(self, engine_name: str, elapsed_seconds: float) -> None:
+        next_engine_name = normalize_engine_name(engine_name)
+        with self._engine_lock:
+            if self.engine.name == next_engine_name:
+                self.status = f"Already using {next_engine_name}"
+                return
+        next_engine = create_transcription_engine(self.settings, engine_name=next_engine_name)
+        with self._engine_lock:
+            self.engine = next_engine
+            self.engine_switches.append(
+                {
+                    "timestamp_seconds": elapsed_seconds,
+                    "engine": next_engine.name,
+                }
+            )
+        self.status = f"Switched to {next_engine.name}"
+
     def render(self, elapsed_seconds: float) -> Panel:
+        with self._engine_lock:
+            engine = self.engine
         grid = Table.grid(expand=True)
         grid.add_column(ratio=1)
         grid.add_row(f"Title: {self.paths.title}")
         grid.add_row(f"Elapsed: {seconds_to_clock(elapsed_seconds)}")
         grid.add_row(f"Status: {self.status}")
-        grid.add_row(f"Model: {self.settings.whisper_model} / {self.settings.whisper_device} / {self.settings.whisper_compute_type}")
+        grid.add_row(f"Engine: {engine.name}")
+        grid.add_row(f"Model: {engine.model_name} / {engine.device} / {engine.compute_type}")
         grid.add_row(f"Output: {self.paths.directory}")
-        grid.add_row("Stop: press q to stop and save. Ctrl+C is emergency abort.")
+        grid.add_row("Keys: 1 faster-whisper | 2 openvino | q stop/save. Ctrl+C is emergency abort.")
 
         transcript = Text()
         with self._lock:
@@ -105,7 +192,12 @@ class LiveSession:
 
                     chunk_index = int(chunk_file.stem.split("_")[-1])
                     offset = chunk_index * self.settings.chunk_seconds
-                    new_segments = self.transcriber.transcribe_file(chunk_file, offset_seconds=offset)
+                    with self._engine_lock:
+                        engine = self.engine
+                    if engine.name == OPENVINO_ENGINE:
+                        seen.add(chunk_file)
+                        continue
+                    new_segments = engine.transcribe_file(chunk_file, offset_seconds=offset)
                     seen.add(chunk_file)
                     if new_segments:
                         self.append_segments(new_segments)
@@ -122,12 +214,67 @@ class LiveSession:
                     continue
                 chunk_index = int(chunk_file.stem.split("_")[-1])
                 offset = chunk_index * self.settings.chunk_seconds
-                new_segments = self.transcriber.transcribe_file(chunk_file, offset_seconds=offset)
+                with self._engine_lock:
+                    engine = self.engine
+                if engine.name == OPENVINO_ENGINE:
+                    seen.add(chunk_file)
+                    continue
+                new_segments = engine.transcribe_file(chunk_file, offset_seconds=offset)
                 seen.add(chunk_file)
                 if new_segments:
                     self.append_segments(new_segments)
         except Exception as exc:  # pragma: no cover - defensive runtime path
             self._error = str(exc)
+
+
+class AudioStreamRouter:
+    def __init__(self, stdout, session: LiveSession) -> None:
+        self._stdout = stdout
+        self._session = session
+        self._stop_event = threading.Event()
+        self._lock = threading.Lock()
+        self._openvino_stream = None
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        self.deactivate_openvino()
+        self._thread.join(timeout=10)
+
+    def activate_openvino(self, offset_seconds: float) -> None:
+        with self._lock:
+            if self._openvino_stream is not None:
+                return
+            with self._session._engine_lock:
+                engine = self._session.engine
+            if engine.name != OPENVINO_ENGINE or not hasattr(engine, "open_stream"):
+                return
+            self._openvino_stream = engine.open_stream(self._session.update_stream_segments, offset_seconds=offset_seconds)
+
+    def deactivate_openvino(self) -> None:
+        with self._lock:
+            stream = self._openvino_stream
+            self._openvino_stream = None
+        if stream is not None:
+            stream.close()
+
+    def _run(self) -> None:
+        while not self._stop_event.is_set():
+            packet = self._stdout.read(16384)
+            if not packet:
+                break
+            with self._lock:
+                stream = self._openvino_stream
+            if stream is not None:
+                try:
+                    stream.send(packet)
+                except Exception as exc:  # pragma: no cover - runtime streaming path
+                    self._session._error = str(exc)
+                    self._session._stop_event.set()
+                    break
 
 
 def print_sources() -> None:
@@ -192,6 +339,7 @@ def doctor() -> None:
     rows = [
         ("ffmpeg", command_exists("ffmpeg")),
         ("pactl", command_exists("pactl")),
+        ("whisper-live", importlib.util.find_spec("whisper_live") is not None),
     ]
 
     table = Table(title="Doctor")
@@ -202,10 +350,40 @@ def doctor() -> None:
     console.print(table)
 
     console.print(f"Output directory: {settings.output_dir()}")
+    console.print(f"Default engine: {normalize_engine_name(settings.transcribe_engine)}")
+    console.print(f"WhisperLive URL: {settings.whisperlive_url}")
     if not settings.audio_mic_source or not settings.audio_system_source:
         console.print("Audio sources are not fully configured in .env")
     if settings.summary_enabled() and not settings.openai_api_key:
         console.print("SUMMARY_PROVIDER is enabled but OPENAI_API_KEY is missing")
+
+
+@app.command("openvino-server")
+def openvino_server(
+    host: str = typer.Option(default="127.0.0.1", help="Host for the WhisperLive WebSocket server."),
+    port: int = typer.Option(default=9090, help="Port for the WhisperLive WebSocket server."),
+    rest_port: int = typer.Option(default=8000, help="Optional REST API port exposed by WhisperLive."),
+) -> None:
+    """Start the WhisperLive OpenVINO server used by `--engine openvino`.
+    """
+
+    try:
+        from whisper_live.server import TranscriptionServer
+    except ImportError as exc:
+        raise typer.BadParameter("whisper-live is not installed. Install it with: pip install whisper-live") from exc
+
+    console.print(f"Starting WhisperLive OpenVINO server on ws://{host}:{port}")
+    console.print(f"REST compatibility endpoint, if needed, will listen on http://{host}:{rest_port}")
+    TranscriptionServer().run(
+        host,
+        port=port,
+        backend="openvino",
+        rest_port=rest_port,
+        enable_rest=True,
+        single_model=True,
+        max_clients=2,
+        max_connection_time=600,
+    )
 
 
 @app.command()
@@ -278,6 +456,7 @@ def transcribe_file(
     summary: bool = typer.Option(default=False, help="Generate summary with configured provider."),
     language: str | None = typer.Option(default=None, help="Language hint, for example auto, en, mr, hi, fr, nl."),
     model: str | None = typer.Option(default=None, help="Override Whisper model for this file."),
+    engine: str | None = typer.Option(default=None, help="Transcription engine: faster-whisper or openvino."),
 ) -> None:
     """Transcribe an existing audio file into a meeting folder.
     """
@@ -287,7 +466,7 @@ def transcribe_file(
     meeting.directory.mkdir(parents=True, exist_ok=True)
 
     console.print(f"Transcribing {audio_file}...")
-    transcriber = ChunkTranscriber(settings, model_name=model, language=language)
+    transcriber = create_transcription_engine(settings, engine_name=engine, model_name=model, language=language)
     segments = transcriber.transcribe_file(audio_file)
     transcript = render_transcript(
         title=meeting.title,
@@ -306,8 +485,9 @@ def transcribe_file(
             "title": meeting.title,
             "started_at": meeting.started_at.isoformat(),
             "source_audio": str(audio_file),
+            "engine": transcriber.name,
             "whisper_model": transcriber.model_name,
-            "device": settings.whisper_device,
+            "device": transcriber.device,
             "compute_type": transcriber.compute_type,
             "language": language or settings.whisper_language,
         },
@@ -324,6 +504,7 @@ def transcribe_file(
 def record(
     title: str | None = typer.Option(default=None, help="Optional meeting title."),
     summary: bool = typer.Option(default=False, help="Generate summary after recording stops."),
+    engine: str | None = typer.Option(default=None, help="Transcription engine: faster-whisper or openvino."),
 ) -> None:
     """Record mic + system audio and show live transcription.
     """
@@ -335,14 +516,26 @@ def record(
         raise typer.BadParameter("Set AUDIO_MIC_SOURCE and AUDIO_SYSTEM_SOURCE in .env. Run `transcribe devices` first.")
 
     settings.output_dir().mkdir(parents=True, exist_ok=True)
-    session = LiveSession(settings, title, summary)
+    session = LiveSession(settings, title, summary, engine)
 
     recorder = start_recording(
         paths=session.paths,
         mic_source=settings.audio_mic_source,
         system_source=settings.audio_system_source,
         chunk_seconds=settings.chunk_seconds,
+        stream_stdout=True,
     )
+
+    stream_router = AudioStreamRouter(recorder.process.stdout, session)
+    stream_router.start()
+    if session.engine.name == OPENVINO_ENGINE:
+        try:
+            stream_router.activate_openvino(0.0)
+            session.status = "Streaming to OpenVINO"
+        except Exception as exc:
+            recorder.stop()
+            stream_router.stop()
+            raise typer.BadParameter(f"Could not start OpenVINO stream: {exc}") from exc
 
     worker = threading.Thread(target=session.process_chunk_files, daemon=True)
     worker.start()
@@ -359,12 +552,28 @@ def record(
                     session.status = "Stopping recorder"
                     live.update(session.render(elapsed))
                     break
+                if key == "1":
+                    try:
+                        session.switch_engine(DEFAULT_ENGINE, elapsed)
+                        stream_router.deactivate_openvino()
+                    except Exception as exc:  # pragma: no cover - runtime configuration path
+                        session.status = f"Could not switch to {DEFAULT_ENGINE}: {exc}"
+                    live.update(session.render(elapsed))
+                if key == "2":
+                    try:
+                        session.switch_engine(OPENVINO_ENGINE, elapsed)
+                        stream_router.activate_openvino(elapsed)
+                        session.status = "Streaming to OpenVINO"
+                    except Exception as exc:  # pragma: no cover - runtime configuration path
+                        session.status = f"Could not switch to {OPENVINO_ENGINE}: {exc}"
+                    live.update(session.render(elapsed))
 
                 time.sleep(0.25)
     except KeyboardInterrupt:
         session.status = "Emergency stop requested"
     finally:
         return_code = recorder.stop()
+        stream_router.stop()
         session._stop_event.set()
         session.status = "Finalizing transcript"
         worker.join()
@@ -373,7 +582,7 @@ def record(
         console.print(session._error)
         raise typer.Exit(code=1)
     if return_code != 0:
-        stderr = recorder.process.stderr.read() if recorder.process.stderr else ""
+        stderr = recorder.process.stderr.read().decode("utf-8", errors="replace") if recorder.process.stderr else ""
         console.print(stderr.strip() or "ffmpeg exited with an error")
         raise typer.Exit(code=1)
 
@@ -398,9 +607,11 @@ def record(
             "title": session.paths.title,
             "started_at": session.paths.started_at.isoformat(),
             "duration_seconds": duration_seconds,
-            "whisper_model": settings.whisper_model,
-            "device": settings.whisper_device,
-            "compute_type": settings.whisper_compute_type,
+            "engine": session.initial_engine_name,
+            "engine_switches": session.engine_switches,
+            "whisper_model": session.engine.model_name,
+            "device": session.engine.device,
+            "compute_type": session.engine.compute_type,
             "language": settings.whisper_language,
             "audio_sources": {
                 "mic": settings.audio_mic_source,

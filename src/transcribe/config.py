@@ -15,6 +15,8 @@ class Settings(BaseSettings):
 
     transcribe_output_dir: Path = Field(default=Path("~/Meetings"))
 
+    transcribe_engine: str = Field(default="faster-whisper")
+
     whisper_model: str = Field(default="small")
     whisper_device: str = Field(default="cpu")
     whisper_compute_type: str = Field(default="int8")
@@ -22,7 +24,11 @@ class Settings(BaseSettings):
     whisper_num_workers: int = Field(default=1)
     whisper_language: str = Field(default="auto")
 
-    chunk_seconds: int = Field(default=20)
+    whisperlive_url: str = Field(default="ws://127.0.0.1:9090")
+    whisperlive_model: str = Field(default="OpenVINO/whisper-tiny-fp16-ov")
+    whisperlive_language: str = Field(default="auto")
+
+    chunk_seconds: int = Field(default=10)
 
     audio_mic_source: str = Field(default="")
     audio_system_source: str = Field(default="")

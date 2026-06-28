@@ -9,14 +9,14 @@ from .meeting import MeetingPaths
 
 @dataclass(slots=True)
 class RecorderProcess:
-    process: subprocess.Popen[str]
+    process: subprocess.Popen[bytes]
     chunk_pattern: Path
 
     def stop(self) -> int:
         if self.process.poll() is None:
             if self.process.stdin:
                 try:
-                    self.process.stdin.write("q\n")
+                    self.process.stdin.write(b"q\n")
                     self.process.stdin.flush()
                 except BrokenPipeError:
                     pass
@@ -32,9 +32,16 @@ class RecorderProcess:
         return self.process.returncode or 0
 
 
-def start_recording(paths: MeetingPaths, mic_source: str, system_source: str, chunk_seconds: int) -> RecorderProcess:
+def start_recording(
+    paths: MeetingPaths,
+    mic_source: str,
+    system_source: str,
+    chunk_seconds: int,
+    stream_stdout: bool = False,
+) -> RecorderProcess:
     paths.directory.mkdir(parents=True, exist_ok=True)
     chunk_pattern = paths.chunks_dir / "chunk_%05d.wav"
+    split_filter = "[0:a][1:a]amix=inputs=2:duration=longest:normalize=0,asplit=3[full][chunks][stream]" if stream_stdout else "[0:a][1:a]amix=inputs=2:duration=longest:normalize=0,asplit=2[full][chunks]"
 
     command = [
         "ffmpeg",
@@ -51,7 +58,7 @@ def start_recording(paths: MeetingPaths, mic_source: str, system_source: str, ch
         "-i",
         system_source,
         "-filter_complex",
-        "[0:a][1:a]amix=inputs=2:duration=longest:normalize=0,asplit=2[full][chunks]",
+        split_filter,
         "-map",
         "[full]",
         "-ac",
@@ -77,13 +84,26 @@ def start_recording(paths: MeetingPaths, mic_source: str, system_source: str, ch
         "1",
         str(chunk_pattern),
     ]
+    if stream_stdout:
+        command.extend(
+            [
+                "-map",
+                "[stream]",
+                "-ac",
+                "1",
+                "-ar",
+                "16000",
+                "-f",
+                "f32le",
+                "pipe:1",
+            ]
+        )
 
     process = subprocess.Popen(
         command,
         stdin=subprocess.PIPE,
-        stdout=subprocess.DEVNULL,
+        stdout=subprocess.PIPE if stream_stdout else subprocess.DEVNULL,
         stderr=subprocess.PIPE,
-        text=True,
     )
     return RecorderProcess(process=process, chunk_pattern=chunk_pattern)
 
